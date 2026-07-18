@@ -4,12 +4,11 @@ Hermes Web UI -- File upload: multipart parser and upload handler.
 import mimetypes
 import os
 import re as _re
-import email.parser
 import tempfile
 from pathlib import Path
 
 from api.config import MAX_UPLOAD_BYTES, STATE_DIR
-from api.helpers import j, bad
+from api.helpers import j
 from api.models import get_session
 from api.workspace import (
     safe_resolve_ws,
@@ -192,7 +191,7 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
     Returns a dict with ``extracted`` (int), ``files`` (list[str]).
     Raises ValueError on zip-slip or unsupported format.
     """
-    import zipfile, tarfile, io, os, shutil
+    import zipfile, tarfile, io, os
 
     cap = _max_extracted_bytes()
     name = Path(filename).name
