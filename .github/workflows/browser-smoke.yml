@@ -20,6 +20,12 @@ on:
     branches: [master]
   push:
     branches: [master]
+  workflow_dispatch:
+
+# Pin to read-only — smoke boots the server without credentials and never
+# writes back to the repo.
+permissions:
+  contents: read
 
 jobs:
   changes:
