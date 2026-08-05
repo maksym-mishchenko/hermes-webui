@@ -2781,7 +2781,6 @@ def _get_cached_session_list_payload(
     return payload
 
 from api.config import (
-    STATE_DIR,
     SESSION_DIR,
     DEFAULT_WORKSPACE,
     DEFAULT_MODEL,
@@ -2790,15 +2789,12 @@ from api.config import (
     LOCK,
     STREAMS,
     STREAMS_LOCK,
-    CANCEL_FLAGS,
     STREAM_LAST_EVENT_ID,
     SERVER_START_TIME,
     _resolve_cli_toolsets,
     get_available_models,
     get_available_models_for_session_visit,
     _provider_is_known_or_configured,
-    IMAGE_EXTS,
-    MD_EXTS,
     MIME_MAP,
     MAX_FILE_BYTES,
     MAX_UPLOAD_BYTES,
@@ -9395,7 +9391,6 @@ from api.models import (
     new_session,
     all_sessions,
     title_from,
-    _write_session_index,
     SESSION_INDEX_FILE,
     _active_state_db_path,
     load_projects,
@@ -9644,7 +9639,6 @@ from api.workspace import (
     _is_within,
     _strip_surrounding_quotes,
     _is_remote_terminal_backend,
-    _workspace_blocked_roots,
 )
 from api.upload import (
     handle_upload,
@@ -26100,6 +26094,7 @@ def _handle_session_import(handler, body):
     return j(handler, {"ok": True, "session": s.compact() | {"messages": s.messages}})
 
 
+# ── MCP Server helpers ──
 def _mask_secrets(obj):
     """Mask sensitive values in env vars and headers."""
     if not isinstance(obj, dict):

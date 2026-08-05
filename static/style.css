@@ -2208,6 +2208,7 @@
   .memory-mtime{font-size:10px;font-weight:400;text-transform:none;opacity:.6;}
   .memory-content{font-size:12px;line-height:1.7;color:var(--text);}
   .memory-content p{margin-bottom:6px;}
+  .memory-plaintext{white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--font-ui);}
   .memory-empty{color:var(--muted);font-size:12px;font-style:italic;}
   .memory-detail-mtime{font-size:11px;color:var(--muted);opacity:.7;margin-bottom:12px;}
   .notes-source-card{border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.03);padding:14px 16px;margin:0 0 12px;}

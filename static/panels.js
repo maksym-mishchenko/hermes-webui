@@ -5364,6 +5364,15 @@ function _renderExternalNotesSources() {
   _setMemoryHeaderButtons('read');
 }
 
+// The agent-managed notes (My Notes / User Profile / Agent Soul) are plaintext,
+// not markdown — they often contain literal characters (e.g. *_TOKEN, *_KEY,
+// apostrophes, backticks) that the chat markdown renderer mangles into stray
+// <strong>/<em>/&#39; artifacts. Render those verbatim. Project Context is a
+// genuine markdown file (HERMES.md/AGENTS.md), so it keeps markdown rendering.
+function _memorySectionRendersMarkdown(section) {
+  return section === 'project_context';
+}
+
 function _renderMemoryDetail(section) {
   if (section === 'external_notes') {
     _renderExternalNotesSources();
@@ -5392,7 +5401,9 @@ function _renderMemoryDetail(section) {
     ? `<div class="memory-detail-mtime">${esc(shadowed.map(item => `${item.name || 'Context file'} present, shadowed by ${item.shadowed_by || fileName || 'active context'}`).join('; '))}</div>`
     : '';
   const inner = content
-    ? `<div class="memory-content preview-md">${renderMd(content)}</div>`
+    ? (_memorySectionRendersMarkdown(section)
+        ? `<div class="memory-content preview-md">${renderMd(content)}</div>`
+        : `<div class="memory-content memory-plaintext">${esc(content)}</div>`)
     : `<div class="memory-empty">${esc(_memorySectionEmpty(meta))}</div>`;
   body.innerHTML = `<div class="main-view-content">${pathHtml}${mtimeHtml}${shadowedHtml}${inner}</div>`;
   body.style.display = '';
