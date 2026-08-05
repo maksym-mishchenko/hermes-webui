@@ -279,6 +279,30 @@ class TestToolCallGroupingStatic:
             "Restoring multi-tool groups must sync both CSS state and accessibility state."
         )
 
+    def test_render_rebuild_preserves_nested_worklog_detail_scroll_position(self):
+        capture_fn = _function_body(UI_JS, "_captureWorklogDetailDisclosureState")
+        restore_fn = _function_body(UI_JS, "_restoreWorklogDetailDisclosureState")
+        body_fn = _function_body(UI_JS, "_worklogDetailScrollableBody")
+
+        assert ".thinking-card-body,.tool-card-detail" in body_fn, (
+            "Nested scroll preservation must cover Thinking bodies and Tool details."
+        )
+        assert "_worklogDetailScrollableBody(el)" in capture_fn, (
+            "The rebuild-state capture must inspect each detail's nested scroll container."
+        )
+        assert "scrollTop:body?Math.max(0,Number(body.scrollTop)||0):0" in capture_fn, (
+            "The captured Worklog detail state must retain the nested scrollTop value."
+        )
+        assert "const saved=state.get(key)" in restore_fn, (
+            "Restoration should read the structured state object for each detail."
+        )
+        assert "const open=(saved&&typeof saved==='object'&&'open' in saved)?saved.open:saved" in restore_fn, (
+            "Restoration must remain backward-compatible with legacy boolean snapshots."
+        )
+        assert "body.scrollTop=Math.min(scrollTop, Math.max(0, body.scrollHeight-body.clientHeight))" in restore_fn, (
+            "Restoration must reapply nested scrollTop after the rebuilt detail is opened."
+        )
+
     def test_worklog_detail_keys_stay_stable_while_streaming_content_grows(self):
         key_fn = _function_body(UI_JS, "_worklogDetailBaseKey")
         append_thinking_fn = _function_body(UI_JS, "appendThinking")
@@ -644,6 +668,43 @@ class TestToolCallGroupingStatic:
         )
         assert "_resetAssistantSegment({closeActivity:true});" not in tool_start_segment, (
             "Tool starts must not split consecutive tools into one-tool Activity rows."
+        )
+
+    def test_reasoning_stream_uses_one_live_renderer_path(self):
+        reasoning_match = re.search(
+            r"source\.addEventListener\('reasoning',e=>\{(.*?)\n\s*\}\);",
+            MESSAGES_JS,
+            re.S,
+        )
+        assert reasoning_match, "reasoning listener not found"
+        reasoning_fn = reasoning_match.group(1)
+        render_live_thinking_fn = _function_body(MESSAGES_JS, "_renderLiveThinking")
+
+        assert reasoning_fn.count("_liveThinkingText()") == 1, (
+            "_liveThinkingText() should be computed once inside the active-session branch."
+        )
+        assert "const liveThinkingText=_liveThinkingText();" in reasoning_fn, (
+            "Reasoning SSE updates should cache the live thinking text before routing."
+        )
+        primary_call = "_upsertAnchorReasoning(liveThinkingText, anchorReasoningFallback)"
+        assert primary_call in reasoning_fn, (
+            "Anchor reasoning must remain the primary renderer path."
+        )
+        fallback_call = "_updateLiveThinkingCard(liveThinkingText,{"
+        assert reasoning_fn.index(primary_call) < reasoning_fn.index(fallback_call), (
+            "The legacy thinking card should only run after anchor upsert fails."
+        )
+        assert "if(!_upsertAnchorReasoning(liveThinkingText, anchorReasoningFallback)){" in reasoning_fn, (
+            "The legacy thinking card should be a falsy-anchor fallback."
+        )
+        assert reasoning_fn.count(fallback_call) == 1, (
+            "Reasoning SSE updates should call the live thinking card only in fallback."
+        )
+        assert "...anchorReasoningFallback" in reasoning_fn, (
+            "The fallback renderer must receive the exact Anchor reasoning identity."
+        )
+        assert "_updateLiveThinkingCard(" in render_live_thinking_fn, (
+            "Inline parsed thinking still needs the live thinking card renderer."
         )
 
     def test_live_thinking_card_is_segment_scoped_not_global_singleton(self):

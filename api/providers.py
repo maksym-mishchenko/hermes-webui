@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -34,11 +35,14 @@ except ImportError:  # pragma: no cover - exercised only where fcntl is unavaila
 from api.config import (
     _PROVIDER_DISPLAY,
     _PROVIDER_MODELS,
+    _coerce_provider_cost_budget,
     _custom_provider_slug_from_name,
     _models_from_live_provider_ids,
+    _pool_entry_payloads,
     _read_live_provider_model_ids,
     _read_visible_codex_cache_model_ids,
     _save_yaml_config_file,
+    _thread_local_env_value,
     get_config,
     invalidate_models_cache,
     reload_config,
@@ -74,6 +78,7 @@ _OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 _PROVIDER_QUOTA_TIMEOUT_SECONDS = 3.0
 _ACCOUNT_USAGE_SUBPROCESS_TIMEOUT_SECONDS = 35.0
 _ACCOUNT_USAGE_CACHE_TTL_SECONDS = 45.0
+_PROVIDERS_CACHE_TTL_SECONDS = 30.0
 _ACCOUNT_USAGE_CACHE_MAX_ENTRIES = 64
 _ACCOUNT_USAGE_WORKER_IDLE_SECONDS = 5 * 60
 _ACCOUNT_USAGE_PROVIDERS = frozenset({"openai-codex", "anthropic"})
@@ -130,6 +135,8 @@ _account_usage_probe_semaphore: threading.BoundedSemaphore | None = None
 # represented as non-None snapshots and remain cacheable.
 _account_usage_status_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
 _account_usage_status_cache_lock = threading.Lock()
+_providers_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+_providers_cache_lock = threading.Lock()
 _account_usage_worker_pool: dict[str, list["_AccountUsageProbeWorker"]] = {}
 _account_usage_worker_pool_lock = threading.Lock()
 
@@ -698,6 +705,7 @@ _PROVIDER_ENV_VAR: dict[str, str] = {
     "mistralai": "MISTRAL_API_KEY",
     "x-ai": "XAI_API_KEY",
     "xiaomi": "XIAOMI_API_KEY",
+    "neuralwatt": "NEURALWATT_API_KEY",
     "opencode-zen": "OPENCODE_ZEN_API_KEY",
     "opencode-go": "OPENCODE_GO_API_KEY",
     # NOTE: bare "ollama" (local) deliberately omitted — local Ollama is keyless
@@ -739,6 +747,20 @@ _PROVIDER_ENV_VAR_ALIASES: dict[str, tuple[str, ...]] = {
     "opencode-zen": ("OPENCODE_API_KEY",),
     "opencode-go": ("OPENCODE_API_KEY",),
 }
+
+_SELF_HOSTED_PROVIDER_IDS = frozenset({"ollama", "lmstudio"})
+
+
+def _provider_credential_env_vars() -> tuple[str, ...]:
+    names = {name for name in _PROVIDER_ENV_VAR.values() if name}
+    for aliases in _PROVIDER_ENV_VAR_ALIASES.values():
+        for alias in aliases or ():
+            if alias:
+                names.add(alias)
+    return tuple(sorted(names))
+
+
+_PROVIDER_CREDENTIAL_ENV_VARS = _provider_credential_env_vars()
 
 # Providers that use OAuth or token flows — their credentials are managed
 # through the Hermes CLI, not via API keys.  The WebUI cannot set these.
@@ -852,11 +874,7 @@ def _local_pool_snapshot(provider):
     or None if the provider has no pool or no entries.
     """
     try:
-        from agent.credential_pool import load_pool
-        from api.config import _is_ambient_gh_cli_entry
-
-        pool = load_pool(provider)
-        entries = list(pool.entries()) if pool is not None and hasattr(pool, "entries") else []
+        entries = [SimpleNamespace(**payload) for payload in _pool_entry_payloads(provider)]
     except Exception:
         return None
     if not entries:
@@ -867,11 +885,6 @@ def _local_pool_snapshot(provider):
     exhausted_count = 0
     dead_count = 0
     for index, entry in enumerate(entries, start=1):
-        source = str(_entry_value(entry, "source") or "")
-        label_val = str(_entry_value(entry, "label", "source") or "")
-        key_source = str(_entry_value(entry, "key_source") or "")
-        if _is_ambient_gh_cli_entry(source, label_val, key_source):
-            continue
         label = _safe_entry_label(entry, index)
         entry_status = str(_entry_value(entry, "last_status") or "").strip().lower()
         if entry_status == "dead":
@@ -957,6 +970,74 @@ def _get_hermes_home() -> Path:
         return Path.home() / ".hermes"
 
 
+def _providers_file_mtime_ns(path: Path) -> int:
+    """Best-effort file mtime for providers-cache invalidation."""
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _providers_config_fingerprint(cfg: Any) -> str:
+    """Stable fingerprint for config fields that shape the Providers response."""
+    try:
+        return hashlib.sha256(
+            json.dumps(cfg, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    except Exception:
+        return repr(cfg)
+
+
+def _providers_cache_key(cfg: Any) -> tuple[Any, ...]:
+    """Return a profile-scoped cache key for ``get_providers()`` (#6010).
+
+    The endpoint reads provider state from the active Hermes home plus the
+    current config.  Include the home path and the two files users commonly
+    mutate from Settings so a short TTL never crosses profile boundaries or
+    masks immediate credential/config changes.
+    """
+    home = _get_hermes_home()
+    try:
+        home_key = str(home.resolve())
+    except OSError:
+        home_key = str(home)
+    return (
+        home_key,
+        _providers_file_mtime_ns(home / ".env"),
+        _providers_file_mtime_ns(home / "config.yaml"),
+        _providers_config_fingerprint(cfg),
+    )
+
+
+def _get_cached_providers(cache_key: tuple[Any, ...]) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with _providers_cache_lock:
+        cached = _providers_cache.get(cache_key)
+        if cached is None:
+            return None
+        ts, payload = cached
+        if now - ts >= _PROVIDERS_CACHE_TTL_SECONDS:
+            _providers_cache.pop(cache_key, None)
+            return None
+        return copy.deepcopy(payload)
+
+
+def _store_cached_providers(cache_key: tuple[Any, ...], payload: dict[str, Any]) -> dict[str, Any]:
+    with _providers_cache_lock:
+        # Single-entry by design: /api/providers is cacheable only for the
+        # active profile/config snapshot, so clear older snapshots to avoid
+        # retaining unbounded provider metadata across profile switches.
+        _providers_cache.clear()
+        _providers_cache[cache_key] = (time.monotonic(), copy.deepcopy(payload))
+    return payload
+
+
+def invalidate_providers_cache() -> None:
+    """Clear cached ``GET /api/providers`` responses."""
+    with _providers_cache_lock:
+        _providers_cache.clear()
+
+
 def _load_env_file(env_path: Path) -> dict[str, str]:
     """Read key=value pairs from a .env file."""
     values: dict[str, str] = {}
@@ -1031,10 +1112,10 @@ def _provider_has_shadowed_codex_oauth_value(provider_id: str) -> bool:
         env_path = _get_hermes_home() / ".env"
         env_values = _load_env_file(env_path)
         values.append(env_values.get(env_var))
-        values.append(os.getenv(env_var))
+        values.append(_thread_local_env_value(env_var))
         for alias in _PROVIDER_ENV_VAR_ALIASES.get(provider_id, ()) or ():
             values.append(env_values.get(alias))
-            values.append(os.getenv(alias))
+            values.append(_thread_local_env_value(alias))
 
     cfg = get_config()
     model_cfg = cfg.get("model", {})
@@ -1042,7 +1123,7 @@ def _provider_has_shadowed_codex_oauth_value(provider_id: str) -> bool:
         active_provider = str(model_cfg.get("provider") or "").strip().lower()
         if active_provider == provider_id:
             values.append(model_cfg.get("api_key"))
-    providers_cfg = cfg.get("providers", {})
+    providers_cfg = cfg.get("providers") or {}
     if isinstance(providers_cfg, dict):
         provider_cfg = providers_cfg.get(provider_id, {})
         if isinstance(provider_cfg, dict):
@@ -1053,7 +1134,7 @@ def _provider_has_shadowed_codex_oauth_value(provider_id: str) -> bool:
             if isinstance(cp, dict) and _custom_provider_name_matches(provider_id, cp.get("name")):
                 cp_key = cp.get("api_key")
                 if isinstance(cp_key, str) and cp_key.startswith("${") and cp_key.endswith("}"):
-                    values.append(os.getenv(cp_key[2:-1]))
+                    values.append(_thread_local_env_value(cp_key[2:-1]))
                 else:
                     values.append(cp_key)
     return any(_looks_like_codex_oauth_token(str(value or "")) for value in values)
@@ -1174,7 +1255,7 @@ def _provider_has_key(provider_id: str) -> bool:
         env_file_value = env_values.get(env_var)
         if _provider_value_counts_as_api_key(provider_id, env_file_value):
             return True
-        env_value = os.getenv(env_var)
+        env_value = _thread_local_env_value(env_var)
         if _provider_value_counts_as_api_key(provider_id, env_value):
             return True
         # Fall back to legacy env-var aliases (e.g. lmstudio's pre-#1500
@@ -1183,7 +1264,7 @@ def _provider_has_key(provider_id: str) -> bool:
         for alias in _PROVIDER_ENV_VAR_ALIASES.get(provider_id, ()) or ():
             if _provider_value_counts_as_api_key(provider_id, env_values.get(alias)):
                 return True
-            if _provider_value_counts_as_api_key(provider_id, os.getenv(alias)):
+            if _provider_value_counts_as_api_key(provider_id, _thread_local_env_value(alias)):
                 return True
     # Check credential pool — covers custom providers registered via
     # `hermes auth add` which store keys in auth.json (not config.yaml).
@@ -1210,7 +1291,7 @@ def _provider_has_key(provider_id: str) -> bool:
             if _provider_value_counts_as_api_key(provider_id, model_cfg.get("api_key")):
                 return True
     # Check providers.<id>.api_key
-    providers_cfg = cfg.get("providers", {})
+    providers_cfg = cfg.get("providers") or {}
     if isinstance(providers_cfg, dict):
         provider_cfg = providers_cfg.get(provider_id, {})
         if isinstance(provider_cfg, dict) and str(provider_cfg.get("api_key") or "").strip():
@@ -1237,14 +1318,14 @@ def _get_provider_api_key(provider_id: str) -> str | None:
         env_file_value = env_values.get(env_var)
         if _provider_value_counts_as_api_key(provider_id, env_file_value):
             return str(env_file_value).strip() or None
-        env_value = os.getenv(env_var)
+        env_value = _thread_local_env_value(env_var)
         if _provider_value_counts_as_api_key(provider_id, env_value):
             return str(env_value).strip() or None
         for alias in _PROVIDER_ENV_VAR_ALIASES.get(provider_id, ()) or ():
             alias_file_value = env_values.get(alias)
             if _provider_value_counts_as_api_key(provider_id, alias_file_value):
                 return str(alias_file_value).strip() or None
-            alias_value = os.getenv(alias)
+            alias_value = _thread_local_env_value(alias)
             if _provider_value_counts_as_api_key(provider_id, alias_value):
                 return str(alias_value).strip() or None
 
@@ -1256,7 +1337,7 @@ def _get_provider_api_key(provider_id: str) -> str | None:
         if model_key and active_provider == provider_id and _provider_value_counts_as_api_key(provider_id, model_key):
             return model_key
 
-    providers_cfg = cfg.get("providers", {})
+    providers_cfg = cfg.get("providers") or {}
     if isinstance(providers_cfg, dict):
         provider_cfg = providers_cfg.get(provider_id, {})
         if isinstance(provider_cfg, dict):
@@ -1272,27 +1353,131 @@ def _get_provider_api_key(provider_id: str) -> str | None:
             if _custom_provider_name_matches(provider_id, cp.get("name")):
                 cp_key = str(cp.get("api_key") or "").strip()
                 if cp_key.startswith("${") and cp_key.endswith("}"):
-                    return os.getenv(cp_key[2:-1], "").strip() or None
+                    return _thread_local_env_value(cp_key[2:-1]).strip() or None
                 if _provider_value_counts_as_api_key(provider_id, cp_key):
                     return cp_key
     # Fallback: try credential pool (e.g. bothub key stored via auth.json)
-    try:
-        from api.config import _has_explicit_pool_credentials, _resolve_provider_alias
-        if _has_explicit_pool_credentials(provider_id):
-            from agent.credential_pool import load_pool
-            # Must resolve alias here too: _has_explicit_pool_credentials does it
-            # internally, but load_pool sees the original unresolved provider_id.
-            _resolved = _resolve_provider_alias(provider_id)
-            pool = load_pool(_resolved)
-            if pool:
-                entry = pool.select()
-                if entry:
-                    key = getattr(entry, "runtime_api_key", "") or getattr(entry, "access_token", "")
-                    if key:
-                        return key
-    except ImportError:
-        pass
+    for entry in _pool_entry_payloads(provider_id):
+        status = str(entry.get("last_status") or "").strip().lower()
+        if status == "dead":
+            continue
+        if status == "exhausted":
+            ns = SimpleNamespace(**entry)
+            if _entry_is_pool_exhausted(ns):
+                continue
+        key = str(
+            entry.get("runtime_api_key")
+            or entry.get("agent_key")
+            or entry.get("access_token")
+            or ""
+        ).strip()
+        if key:
+            return key
     return None
+
+
+def provider_has_usable_credential(provider_id: str, *, refresh: bool = False) -> bool:
+    """Return True when a provider has a currently usable configured credential."""
+    provider = str(provider_id or "").strip().lower()
+    if not provider:
+        return False
+    if refresh:
+        try:
+            from api.config import invalidate_credential_pool_cache
+
+            invalidate_credential_pool_cache(provider)
+        except Exception:
+            logger.debug("Failed to refresh credential pool before provider availability check", exc_info=True)
+    return _get_provider_api_key(provider) is not None
+
+
+def provider_has_usable_pool_credential(provider_id: str, *, refresh: bool = False) -> bool:
+    """Return True only when the provider's credential-pool lane has a usable entry."""
+    provider = str(provider_id or "").strip().lower()
+    if not provider:
+        return False
+    if refresh:
+        try:
+            from api.config import invalidate_credential_pool_cache
+
+            invalidate_credential_pool_cache(provider)
+        except Exception:
+            logger.debug("Failed to refresh credential pool before pool availability check", exc_info=True)
+    for entry in _pool_entry_payloads(provider):
+        status = str(entry.get("last_status") or "").strip().lower()
+        if status == "dead":
+            continue
+        if status == "exhausted":
+            ns = SimpleNamespace(**entry)
+            if _entry_is_pool_exhausted(ns):
+                continue
+        key = str(
+            entry.get("runtime_api_key")
+            or entry.get("agent_key")
+            or entry.get("access_token")
+            or ""
+        ).strip()
+        if key:
+            return True
+    return False
+
+
+def _credential_secret_fingerprint(secret: str) -> str:
+    value = str(secret or "").strip()
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def _entry_secret_fingerprint(entry: dict) -> str:
+    value = str(entry.get("secret_fingerprint") or "").strip().lower()
+    if value.startswith("sha256:"):
+        value = value[len("sha256:"):]
+    if not value:
+        return ""
+    if all(ch in "0123456789abcdef" for ch in value):
+        return value[:16]
+    return ""
+
+
+def _pool_entry_currently_unusable(entry: dict) -> bool:
+    status = str(entry.get("last_status") or "").strip().lower()
+    if status == "dead":
+        return True
+    if status == "exhausted":
+        ns = SimpleNamespace(**entry)
+        return _entry_is_pool_exhausted(ns)
+    return False
+
+
+def provider_has_process_wakeup_recovery_credential(provider_id: str, *, refresh: bool = False) -> bool:
+    """Return True when a paused credential-pool wakeup lane can safely retry."""
+    provider = str(provider_id or "").strip().lower()
+    if not provider:
+        return False
+    if provider_has_usable_pool_credential(provider, refresh=refresh):
+        return True
+    configured_key = _get_provider_api_key(provider)
+    if not configured_key:
+        return False
+    configured_fingerprint = _credential_secret_fingerprint(configured_key)
+    if not configured_fingerprint:
+        return False
+    has_unusable_pool_entry = False
+    has_unknown_unusable_pool_entry = False
+    for entry in _pool_entry_payloads(provider):
+        entry_fingerprint = _entry_secret_fingerprint(entry)
+        if not _pool_entry_currently_unusable(entry):
+            if entry_fingerprint and entry_fingerprint == configured_fingerprint:
+                return True
+            continue
+        has_unusable_pool_entry = True
+        if not entry_fingerprint:
+            has_unknown_unusable_pool_entry = True
+            continue
+        if entry_fingerprint == configured_fingerprint:
+            return False
+    return has_unusable_pool_entry and not has_unknown_unusable_pool_entry
 
 
 def _active_provider_id() -> str | None:
@@ -1393,6 +1578,24 @@ def _agent_fetch_account_usage(provider: str, *, base_url: str | None = None, ap
 
 def _account_usage_subprocess_env(home: Path, provider: str, api_key: str | None) -> dict[str, str]:
     env = dict(os.environ)
+    try:
+        from api.config import _thread_ctx
+    except Exception:
+        _thread_ctx = None
+    if bool(getattr(_thread_ctx, "block_process_env_fallback", False)):
+        # Rely on the centralized profile scrub set (api.profiles), which unions
+        # the WebUI provider env vars + the agent auth registry + the non-registry
+        # agent credential fallback (CUSTOM_API_KEY, AWS/Bedrock family). Falling
+        # back to the WebUI-only set keeps the probe fail-closed if that import
+        # fails. (#3961 — don't leave a partial local AWS set here.)
+        _strip = set(_PROVIDER_CREDENTIAL_ENV_VARS)
+        try:
+            from api.profiles import _profile_secret_env_names, get_active_hermes_home
+            _strip.update(_profile_secret_env_names(get_active_hermes_home()))
+        except Exception:
+            _strip.update({"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"})
+        for env_name in _strip:
+            env.pop(env_name, None)
     env["HERMES_HOME"] = str(Path(home))
 
     # Profile .env values should affect only the child quota probe, not the
@@ -2026,6 +2229,16 @@ _COST_SNAPSHOT_MAX_DAYS = 365  # hard cap to prevent unbounded growth
 _COST_SNAPSHOT_LOCK = threading.Lock()
 
 
+def _get_provider_cost_budget() -> float | None:
+    """Return the user-configured monthly spend budget, or None if unset."""
+    try:
+        from api.config import load_settings
+        raw = load_settings().get("provider_cost_budget")
+        return _coerce_provider_cost_budget(raw)
+    except Exception:
+        return None
+
+
 def _cost_snapshots_dir() -> Path:
     """Return the directory for cost-snapshot JSON files.
 
@@ -2245,6 +2458,7 @@ def get_provider_cost_history(provider_id: str | None = None, days: int = 7) -> 
         }
 
     display_name = _PROVIDER_DISPLAY.get("openrouter", "OpenRouter")
+    monthly_budget = _get_provider_cost_budget()
     api_key = _get_provider_api_key("openrouter")
     if not api_key:
         return {
@@ -2253,6 +2467,7 @@ def get_provider_cost_history(provider_id: str | None = None, days: int = 7) -> 
             "display_name": display_name,
             "supported": True,
             "status": "no_key",
+            "monthly_budget": monthly_budget,
             "message": "OpenRouter cost history needs an OPENROUTER_API_KEY configured on the server.",
         }
 
@@ -2273,6 +2488,7 @@ def get_provider_cost_history(provider_id: str | None = None, days: int = 7) -> 
             "snapshots": deltas,
             "limit": None,
             "label": None,
+            "monthly_budget": monthly_budget,
             "message": "OpenRouter cost history is temporarily unavailable. Showing last known data.",
         }
 
@@ -2294,6 +2510,7 @@ def get_provider_cost_history(provider_id: str | None = None, days: int = 7) -> 
         "snapshots": deltas,
         "limit": key_info.get("limit"),
         "label": key_info.get("label") or "OpenRouter credits",
+        "monthly_budget": monthly_budget,
         "message": "OpenRouter cost history loaded.",
     }
 
@@ -2313,15 +2530,19 @@ def get_providers() -> dict[str, Any]:
       ``config_yaml``, ``oauth``, ``none``)
     - ``models``: list of known model IDs for this provider
     """
-    providers = []
-
     # Collect all known provider IDs from multiple sources
     known_ids = set(_PROVIDER_DISPLAY.keys()) | set(_PROVIDER_MODELS.keys())
     known_ids.update(plugin_model_provider_ids())
 
     # Also detect providers from config.yaml providers section
     cfg = get_config()
-    providers_cfg = cfg.get("providers", {})
+    cache_key = _providers_cache_key(cfg)
+    cached = _get_cached_providers(cache_key)
+    if cached is not None:
+        return cached
+
+    providers = []
+    providers_cfg = cfg.get("providers") or {}
     if isinstance(providers_cfg, dict):
         known_ids.update(providers_cfg.keys())
 
@@ -2381,7 +2602,7 @@ def get_providers() -> dict[str, Any]:
                 env_values = _load_env_file(env_path)
                 if _provider_value_counts_as_api_key(pid, env_values.get(env_var)):
                     key_source = "env_file"
-                elif _provider_value_counts_as_api_key(pid, os.getenv(env_var)):
+                elif _provider_value_counts_as_api_key(pid, _thread_local_env_value(env_var)):
                     key_source = "env_var"
                 else:
                     # Canonical name not set; check legacy aliases (e.g. lmstudio's
@@ -2394,7 +2615,7 @@ def get_providers() -> dict[str, Any]:
                             key_source = "env_file"
                             aliased = True
                             break
-                        if _provider_value_counts_as_api_key(pid, os.getenv(alias)):
+                        if _provider_value_counts_as_api_key(pid, _thread_local_env_value(alias)):
                             key_source = "env_var"
                             aliased = True
                             break
@@ -2544,12 +2765,20 @@ def get_providers() -> dict[str, Any]:
                 if pid != "nous":
                     models_total = len(models)
 
+        is_self_hosted = pid in _SELF_HOSTED_PROVIDER_IDS
+        try:
+            from api.config import _get_provider_base_url
+            provider_base_url = _get_provider_base_url(pid) if is_self_hosted else None
+        except Exception:
+            provider_base_url = None
         _is_plugin = is_plugin_model_provider(pid)
         providers.append({
             "id": pid,
             "display_name": display_name,
             "has_key": has_key,
             "configurable": not is_oauth and bool(_provider_env_var_for(pid)),
+            "is_self_hosted": is_self_hosted,
+            "base_url": provider_base_url,
             "is_plugin_provider": _is_plugin,
             "is_oauth": is_oauth,
             "key_source": key_source,
@@ -2591,7 +2820,7 @@ def get_providers() -> dict[str, Any]:
             # Replace env var reference to check actual value
             if cp_api_key.startswith("${") and cp_api_key.endswith("}"):
                 env_var = cp_api_key[2:-1]
-                cp_has_key = bool(os.getenv(env_var, "").strip())
+                cp_has_key = bool(_thread_local_env_value(env_var).strip())
             # Fallback: check credential pool (key added via hermes auth add)
             if not cp_has_key:
                 try:
@@ -2629,10 +2858,11 @@ def get_providers() -> dict[str, Any]:
         return (3, pid)
     providers.sort(key=_provider_sort_key)
 
-    return {
+    result = {
         "providers": providers,
         "active_provider": active_provider,
     }
+    return _store_cached_providers(cache_key, result)
 
 
 def set_provider_key(provider_id: str, api_key: str | None) -> dict[str, Any]:
@@ -2685,6 +2915,7 @@ def set_provider_key(provider_id: str, api_key: str | None) -> dict[str, Any]:
     # disrupting active streaming sessions that may be reading config.cfg.
     invalidate_models_cache()
     invalidate_account_usage_status_cache(provider_id)
+    invalidate_providers_cache()
 
     return {
         "ok": True,
@@ -2754,7 +2985,7 @@ def _clean_provider_key_from_config(provider_id: str) -> None:
                 return
 
             # 1. Clean providers.<id>.api_key
-            providers_cfg = cfg.get("providers", {})
+            providers_cfg = cfg.get("providers") or {}
             if isinstance(providers_cfg, dict):
                 provider_cfg = providers_cfg.get(provider_id, {})
                 if isinstance(provider_cfg, dict) and provider_cfg.get("api_key"):
@@ -2787,5 +3018,6 @@ def _clean_provider_key_from_config(provider_id: str) -> None:
         # reload_config() also acquires _cfg_lock internally.
         if changed:
             reload_config()
+            invalidate_providers_cache()
     except Exception:
         logger.exception("Failed to clean provider key from config.yaml for %s", provider_id)

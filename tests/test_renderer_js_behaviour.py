@@ -41,6 +41,20 @@ const _IMAGE_EXTS=/\.(png|jpg|jpeg|gif|webp|bmp|ico|avif)$/i;
 const _SVG_EXTS=/\.svg$/i;
 const _AUDIO_EXTS=/\.(mp3|ogg|wav|m4a|aac|flac|wma|opus|webm)$/i;
 const _VIDEO_EXTS=/\.(mp4|webm|mkv|mov|avi|ogv|m4v)$/i;
+// Minimal stand-in for ui.js' _inlineMediaHtmlForRef used when the driver
+// extracts only renderMd(). Mirrors the live UI for the cases the existing
+// tests assert against (https image, bare file:// image). The full renderer
+// (ui.js) is preferred on the real page — these nodes only cover what is
+// reachable from a standalone renderMd() invocation.
+function _inlineMediaHtmlForRef(ref){
+  const r = String(ref || '');
+  if (/^https?:\/\//.test(r)) return `<img class="msg-media-img" src="${esc(r)}" alt="image" loading="lazy">`;
+  if (/^file:\/\//.test(r)){
+    const m = r.replace(/^file:\/\//i, '');
+    return `<img class="msg-media-img" src="api/media?path=${encodeURIComponent(m)}" alt="image" loading="lazy">`;
+  }
+  return `<img class="msg-media-img" src="api/media?path=${encodeURIComponent(r)}" alt="image" loading="lazy">`;
+}
 
 function extractFunc(name) {
   const re = new RegExp('function\\s+' + name + '\\s*\\(');
@@ -242,6 +256,25 @@ class TestCommonLLMShapes:
         assert "<p><table" not in out
         assert "</table></p>" not in out
 
+    def test_table_pipe_inside_inline_code_is_protected(self, driver_path):
+        """Pipes inside backtick code in table cells must not create extra columns."""
+        src = (
+            "| field | expr |\n"
+            "| --- | --- |\n"
+            "| set | `updates.model = modelState.model || null` |\n"
+        )
+        out = _render(driver_path, src)
+        # Must be exactly 2 cells in the data row
+        assert "<th>field</th>" in out
+        assert "<th>expr</th>" in out
+        # The code cell should contain both pipes
+        assert "<code>" in out
+        assert "||" in out
+        # Must NOT split into extra cells
+        assert out.count("<td>") == 2, (
+            f"Expected exactly 2 <td> cells, got {out.count('<td>')}: {out!r}"
+        )
+
     def test_strikethrough_outside_quote(self, driver_path):
         out = _render(driver_path, "This was ~~outdated~~ but is now fine.")
         assert "<del>outdated</del>" in out
@@ -397,7 +430,7 @@ class TestFencedCodeFenceLength:
             "That is much more correct than pretending"
         )
         out = _render(driver_path, src)
-        assert out.count("<pre>") == 1
+        assert out.count("<pre class=\"md-source-block\">") == 1
         assert out.count("</pre>") == 1
         assert '<div class="pre-header">md</div>' in out
         assert "```novelcrafter" in out
@@ -408,7 +441,7 @@ class TestFencedCodeFenceLength:
 
     def test_four_backtick_outer_fence_preserves_inner_triple_fence(self, driver_path):
         out = _render(driver_path, "````md\n```inner\nfoo\n```\n````\n")
-        assert out.count("<pre>") == 1
+        assert out.count("<pre class=\"md-source-block\">") == 1
         assert out.count("</pre>") == 1
         assert '<div class="pre-header">md</div>' in out
         assert "```inner" in out

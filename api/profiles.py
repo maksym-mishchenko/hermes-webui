@@ -21,6 +21,7 @@ from typing import Optional
 
 import yaml
 
+from api.paths import _atomic_write_text
 from api.session_events import publish_session_list_changed
 
 logger = logging.getLogger(__name__)
@@ -33,14 +34,16 @@ _PROFILE_DIRS = [
 ]
 _CLONE_CONFIG_FILES = ['config.yaml', '.env', 'SOUL.md']
 
-# ── Snapshot initial HERMES_HOME before init_profile_state() mutates it ──────
-# _is_isolated_profile_mode() needs to detect whether HERMES_HOME *at startup*
-# points to a profile subdirectory (e.g., ~/.hermes/profiles/user1), not the
-# base home (~/.hermes). But init_profile_state() overwrites HERMES_HOME to the
-# base home, which would disable isolation detection. Snapshot it here at import
-# time (before init_profile_state runs) and use the snapshot in the detector.
+# ── Snapshot startup env before profile init / dotenv reload mutates it ───────
+# _is_isolated_profile_mode() needs startup HERMES_HOME, not the value after
+# init_profile_state() rewrites it. The opt-in flag is also an operator-level
+# startup control: a pinned profile's .env may be loaded into live os.environ
+# later, but must not be able to change whether the process is isolated.
 _INITIAL_HERMES_HOME = os.getenv('HERMES_HOME', '').strip()
+_INITIAL_ISOLATED_PROFILE_OPT_IN = os.getenv('HERMES_WEBUI_ISOLATED_PROFILE', '').strip().lower()
 _ISOLATED_SYMLINK_WARNING_EMITTED = False
+_ISOLATED_PROFILE_SHAPE_WITHOUT_OPT_IN_WARNING_EMITTED = False
+_ISOLATED_PROFILE_TRUTHY_VALUES = frozenset({'1', 'true', 'yes', 'on'})
 
 # ── Module state ────────────────────────────────────────────────────────────
 _active_profile = 'default'
@@ -54,6 +57,7 @@ _loaded_profile_env_keys: set[str] = set()
 _tls = threading.local()
 
 _SKILL_HOME_MODULES = ("tools.skills_tool", "tools.skill_manager_tool")
+_SKILL_HOME_MODULE_PATCH_LOCK = threading.RLock()
 
 
 def snapshot_skill_home_modules() -> dict[str, dict[str, object]]:
@@ -72,6 +76,71 @@ def snapshot_skill_home_modules() -> dict[str, dict[str, object]]:
             "SKILLS_DIR": getattr(module, "SKILLS_DIR", None),
         }
     return snapshot
+
+
+def _skill_modules_support_profile_home(profile_home: Path) -> bool:
+    """Return ``True`` when both skill modules resolve to this profile home."""
+    expected_dir = (Path(profile_home) / 'skills').expanduser()
+
+    for module_name in _SKILL_HOME_MODULES:
+        module = sys.modules.get(module_name)
+        if module is None:
+            logger.debug("Skill capability check: %s not pre-imported in sys.modules", module_name)
+            return False
+
+        if not hasattr(module, 'SKILLS_DIR'):
+            logger.debug("Skill capability check: %s missing SKILLS_DIR", module_name)
+            return False
+
+        if not hasattr(module, '_SKILLS_DIR_AT_IMPORT'):
+            logger.debug("Skill capability check: %s missing _SKILLS_DIR_AT_IMPORT", module_name)
+            return False
+
+        try:
+            current_skills_dir = Path(module.SKILLS_DIR).expanduser()
+            import_skills_dir = Path(module._SKILLS_DIR_AT_IMPORT).expanduser()
+        except Exception:
+            logger.debug(
+                "Skill capability check: %s has invalid SKILLS_DIR or _SKILLS_DIR_AT_IMPORT",
+                module_name,
+                exc_info=True,
+            )
+            return False
+
+        if current_skills_dir != import_skills_dir:
+            logger.debug(
+                "Skill capability check: %s.SKILLS_DIR %r does not match imported baseline %r",
+                module_name,
+                current_skills_dir,
+                import_skills_dir,
+            )
+            return False
+
+        skills_dir = getattr(module, '_skills_dir', None)
+        if not callable(skills_dir):
+            logger.debug("Skill capability check: %s._skills_dir is not callable", module_name)
+            return False
+
+        try:
+            resolved = Path(skills_dir()).expanduser()
+        except Exception:
+            logger.debug(
+                "Skill capability check: %s._skills_dir() failed",
+                module_name,
+                exc_info=True,
+            )
+            return False
+
+        if resolved != expected_dir:
+            logger.debug(
+                "Skill capability check: %s resolves %r instead of %r",
+                module_name,
+                str(resolved),
+                str(expected_dir),
+            )
+            return False
+
+    return True
 
 
 def patch_skill_home_modules(home: Path) -> None:
@@ -145,17 +214,33 @@ def _isolated_profile_opt_in() -> bool:
 
     Accepts the usual truthy values; default (unset/empty/falsey) is OFF.
 
-    Security: this reads the operator-set env var live, but a pinned profile's
-    ``.env`` can NEVER override it — ``_reload_dotenv()`` explicitly refuses to
-    copy ``HERMES_WEBUI_ISOLATED_PROFILE`` from a profile ``.env`` into
-    ``os.environ`` (see ``_PROTECTED_ENV_KEYS``). Otherwise a contained user could
-    set ``HERMES_WEBUI_ISOLATED_PROFILE=0`` in their own profile ``.env`` and
-    silently escape isolation (#4589). The opt-in is an operator/deployment
-    posture, never a per-profile-file toggle.
+    Security: this reads the startup snapshot, not live ``os.environ``. A pinned
+    profile's ``.env`` is loaded after import, so live env can be profile-owned;
+    the opt-in must remain the operator/launcher posture captured at process
+    start (#4590). ``_reload_dotenv()`` and the runtime env paths still filter the
+    key as defense-in-depth, but detection does not depend on that filtering.
     """
-    return os.getenv('HERMES_WEBUI_ISOLATED_PROFILE', '').strip().lower() in (
-        '1', 'true', 'yes', 'on',
+    return _INITIAL_ISOLATED_PROFILE_OPT_IN in _ISOLATED_PROFILE_TRUTHY_VALUES
+
+
+def _warn_if_profile_shape_without_isolated_opt_in() -> None:
+    """Log once when HERMES_HOME looks pinned but startup opt-in is absent."""
+    global _ISOLATED_PROFILE_SHAPE_WITHOUT_OPT_IN_WARNING_EMITTED
+    if _ISOLATED_PROFILE_SHAPE_WITHOUT_OPT_IN_WARNING_EMITTED:
+        return
+    hermes_home = _INITIAL_HERMES_HOME
+    if not hermes_home:
+        return
+    p = Path(hermes_home).expanduser()
+    if p.parent.name != 'profiles' or not p.name:
+        return
+    logger.warning(
+        "HERMES_HOME points at a profile directory (%s), but "
+        "HERMES_WEBUI_ISOLATED_PROFILE was not enabled at startup; isolated "
+        "profile mode stays off and normal multi-profile switching remains enabled.",
+        p,
     )
+    _ISOLATED_PROFILE_SHAPE_WITHOUT_OPT_IN_WARNING_EMITTED = True
 
 
 def _is_isolated_profile_mode() -> bool:
@@ -183,9 +268,12 @@ def _is_isolated_profile_mode() -> bool:
     not the current os.environ value. init_profile_state() overwrites HERMES_HOME
     at startup, which would disable detection if we read it here.
     """
-    # PRIMARY gate: explicit opt-in. Default OFF → a normal named-profile launch
-    # is never treated as isolated, so profile switching keeps working (#4586).
+    # PRIMARY gate: explicit startup opt-in. Default OFF → a normal named-profile
+    # launch is never treated as isolated, so profile switching keeps working
+    # (#4586). Read the snapshot, not live os.environ, so profile .env reloads
+    # cannot silently flip the deployment posture (#4590).
     if not _isolated_profile_opt_in():
+        _warn_if_profile_shape_without_isolated_opt_in()
         return False
 
     hermes_home = _INITIAL_HERMES_HOME
@@ -864,11 +952,223 @@ def filter_runtime_env_for_gateway_parity(env: dict[str, str]) -> dict[str, str]
     return filtered
 
 
+# Credential env vars the agent runtime resolves via raw os.getenv() that are
+# NOT in hermes_cli.auth.PROVIDER_REGISTRY (so the registry-derived scrub set
+# would miss them). Fail-closed list — verified against the installed agent:
+#   CUSTOM_API_KEY            hermes_cli/models.py (generic custom provider key)
+#   AZURE_ANTHROPIC_KEY       hermes_cli/runtime_provider.py (Azure-hosted Anthropic)
+#   AZURE_FOUNDRY_API_KEY     hermes_cli/runtime_provider.py (Azure Foundry key)
+#   AZURE_* identity family   agent/azure_identity_adapter.py (service-principal /
+#                             workload-identity model auth)
+#   AWS_BEARER_TOKEN_BEDROCK  hermes_cli/model_switch.py (Bedrock bearer token)
+#   AWS_* credential chain    agent/bedrock_adapter.py + model_switch._has_aws_creds
+#                             (boto3 access keys, session token, profile,
+#                              container/web-identity credential providers)
+# NOTE: region/base-url config vars (AWS_REGION, AWS_DEFAULT_REGION,
+# AZURE_FOUNDRY_BASE_URL) are deliberately NOT included — they're configuration,
+# not credentials, and the child probe may legitimately need them.
+# Stripping these in a profile-scoped read prevents an empty named profile from
+# inheriting the server-process credential (#3961 residual cross-profile leak).
+_NON_REGISTRY_AGENT_CREDENTIAL_ENV_NAMES: tuple[str, ...] = (
+    "CUSTOM_API_KEY",
+    # Anthropic OAuth/token aliases. These ARE in the agent auth registry, but
+    # are duplicated here as a fail-closed floor so the scrub still covers them
+    # when the agent package can't be imported (e.g. a WebUI-only CI/test env
+    # where hermes_cli.auth is absent) — the registry union is best-effort.
+    "ANTHROPIC_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "AZURE_ANTHROPIC_KEY",
+    "AZURE_FOUNDRY_API_KEY",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_TENANT_ID",
+    "AZURE_FEDERATED_TOKEN_FILE",
+    # Azure managed-identity (App Service MSI / IMDS) credential-source vars —
+    # agent/azure_identity_adapter.py treats these as ManagedIdentityCredential
+    # sources, so an empty named profile must not inherit the host's managed
+    # identity. (NOT AZURE_FOUNDRY_BASE_URL — that's config, kept.)
+    "IDENTITY_ENDPOINT",
+    "IDENTITY_HEADER",
+    "MSI_ENDPOINT",
+    "MSI_SECRET",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_PROFILE",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+)
+
+
+def _agent_registry_credential_env_names() -> set[str]:
+    """Credential env-var names the *agent* runtime reads, beyond the WebUI's own
+    settable-key map. Two sources:
+
+    1. ``hermes_cli.auth.PROVIDER_REGISTRY[*].api_key_env_vars`` — every provider
+       the agent CLI knows, incl. OAuth/token-flow providers like Anthropic's
+       ``ANTHROPIC_TOKEN`` / ``CLAUDE_CODE_OAUTH_TOKEN`` that the WebUI's own
+       ``_PROVIDER_ENV_VAR`` map omits (they aren't WebUI-settable API keys).
+    2. ``_NON_REGISTRY_AGENT_CREDENTIAL_ENV_NAMES`` — a fail-closed fallback for
+       credential env vars the agent resolves via raw ``os.getenv()`` that are NOT
+       in the auth registry (the generic ``CUSTOM_API_KEY`` and the AWS/Bedrock
+       credential family the bedrock adapter relies on).
+
+    A profile scrub built only from the WebUI map would leave all of these in
+    ``os.environ`` — letting an empty named profile inherit the server-process
+    credential on the quota subprocess and detached-worker model-rebuild paths
+    (#3961 residual cross-profile leak)."""
+    names: set[str] = set(_NON_REGISTRY_AGENT_CREDENTIAL_ENV_NAMES)
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        registry = PROVIDER_REGISTRY
+        items = registry.items() if hasattr(registry, "items") else enumerate(registry)
+        for _key, entry in items:
+            env_vars = getattr(entry, "api_key_env_vars", None)
+            for env_var in env_vars or ():
+                if env_var:
+                    names.add(str(env_var))
+    except Exception:
+        logger.debug(
+            "Failed to load agent registry credential env names for profile scope",
+            exc_info=True,
+        )
+    return names
+
+
+def _profile_secret_env_names(profile_home_path: Path) -> set[str]:
+    names: set[str] = set()
+    try:
+        from api.providers import _provider_credential_env_vars
+
+        names.update(_provider_credential_env_vars())
+    except Exception:
+        logger.debug(
+            "Failed to load provider credential env names for profile scope",
+            exc_info=True,
+        )
+
+    # Also scrub credential env vars the agent runtime resolves directly
+    # (OAuth/token-flow providers absent from the WebUI's settable-key map) so a
+    # profile-scoped read can't inherit the server process's ANTHROPIC_TOKEN /
+    # CLAUDE_CODE_OAUTH_TOKEN etc. (#3961 cross-profile residual leak).
+    names.update(_agent_registry_credential_env_names())
+
+    config_path = Path(profile_home_path) / "config.yaml"
+    if not config_path.exists():
+        return names
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        logger.debug(
+            "Failed to inspect custom-provider credential env names from %s",
+            config_path,
+            exc_info=True,
+        )
+        return names
+
+    custom_providers = payload.get("custom_providers") if isinstance(payload, dict) else None
+    if not isinstance(custom_providers, list):
+        return names
+    for custom_provider in custom_providers:
+        if not isinstance(custom_provider, dict):
+            continue
+        key_env = str(custom_provider.get("key_env") or "").strip()
+        if key_env:
+            names.add(key_env)
+        api_key = str(custom_provider.get("api_key") or "").strip()
+        match = re.fullmatch(r"\$\{([^}]+)\}", api_key)
+        if match:
+            env_name = str(match.group(1) or "").strip()
+            if env_name:
+                names.add(env_name)
+    return names
+
+
+def _apply_profile_env_to_process(
+    process_env,
+    safe_runtime_env: dict[str, str],
+    *,
+    secret_env_names: set[str],
+) -> dict[str, Optional[str]]:
+    scoped_keys = set(safe_runtime_env) | set(secret_env_names)
+    previous_env = {key: process_env.get(key) for key in scoped_keys}
+    for key in secret_env_names:
+        if key not in safe_runtime_env:
+            process_env.pop(key, None)
+    return previous_env
+
+
+_secret_scope_available = None
+
+
+def _resolve_secret_scope_module():
+    global _secret_scope_available
+    import sys as _sys
+    mod = _sys.modules.get('agent.secret_scope')
+    if mod is not None:
+        return mod
+    if _secret_scope_available is False:
+        return None
+    if _secret_scope_available is None:
+        try:
+            import importlib.util
+            _secret_scope_available = importlib.util.find_spec('agent') is not None
+        except Exception:
+            _secret_scope_available = False
+    if _secret_scope_available:
+        try:
+            from agent.secret_scope import set_secret_scope, reset_secret_scope  # noqa: F401
+            return _sys.modules.get('agent.secret_scope')
+        except ImportError:
+            _secret_scope_available = False
+    return None
+
+
+# #5567: hermes-agent v0.18.0+ exposes a CONTEXT-LOCAL Hermes-home override
+# (`hermes_constants.set_hermes_home_override`) that `get_hermes_home()` — and
+# therefore `hermes_cli.config.get_config_path()` / `load_config()` — consults
+# BEFORE the process-global `os.environ["HERMES_HOME"]`. Installing it inside the
+# profile worker scope eliminates the cross-profile HERMES_HOME race at the
+# reader (a config read resolves the task-local profile home even if another
+# thread clobbers os.environ mid-body) WITHOUT serializing workers or mutating
+# shared state. Resolved lazily + optionally so OLDER agents (no override symbol)
+# degrade gracefully to the pre-existing os.environ-mirror behavior — unchanged.
+_hermes_home_override_available = None
+
+
+def _resolve_hermes_home_override():
+    """Return the hermes_constants module iff it exposes the v0.18.0+ context-local
+    home override (set/reset), else None. Cached; import-safe on older agents."""
+    global _hermes_home_override_available
+    import sys as _sys
+    if _hermes_home_override_available is False:
+        return None
+    mod = _sys.modules.get('hermes_constants')
+    if mod is None and _hermes_home_override_available is None:
+        try:
+            import hermes_constants as mod  # noqa: F811
+        except Exception:
+            _hermes_home_override_available = False
+            return None
+    if mod is not None and hasattr(mod, 'set_hermes_home_override') and hasattr(
+        mod, 'reset_hermes_home_override'
+    ):
+        _hermes_home_override_available = True
+        return mod
+    _hermes_home_override_available = False
+    return None
+
+
 @contextmanager
 def profile_env_for_background_worker(
     session,
     purpose: str = "background worker",
     logger_override: Optional[logging.Logger] = None,
+    *,
+    scope_skill_modules: bool = True,
 ):
     """Temporarily route detached worker config reads through a profile.
 
@@ -893,6 +1193,7 @@ def profile_env_for_background_worker(
         profile_home_path = Path(get_hermes_home_for_profile(profile))
         runtime_env = get_profile_runtime_env(profile_home_path)
         safe_runtime_env = filter_runtime_env_for_gateway_parity(runtime_env)
+        secret_env_names = _profile_secret_env_names(profile_home_path)
     except Exception:
         log.debug(
             "Failed to resolve profile env for %s profile %s; falling back to current env",
@@ -915,70 +1216,245 @@ def profile_env_for_background_worker(
     old_hermes_home = None
     had_hermes_home = False
     previous_thread_env = getattr(_thread_ctx, "env", {}).copy()
+    previous_block_process_env = bool(
+        getattr(_thread_ctx, "block_process_env_fallback", False)
+    )
+    _scope_token = None
+    _has_scope = False
+    _secret_scope_mod = None
+    # #5567: context-local Hermes-home override (hermes-agent v0.18.0+). None on
+    # older agents → graceful no-op (falls back to the os.environ mirror below).
+    _home_override_mod = None
+    _home_override_token = None
+    _home_override_installed = False
+    has_profile_skill_home = False
+    should_restore_skill_modules = False
+    _acquired_skill_home_patch_lock = False
     try:
         _set_thread_env(**thread_env)
+        _thread_ctx.block_process_env_fallback = True
+        _secret_scope_mod = _resolve_secret_scope_module()
+        _scope_token = None
+        _has_scope = False
+        if _secret_scope_mod is not None:
+            try:
+                _scope_token = _secret_scope_mod.set_secret_scope(thread_env)
+                _has_scope = True
+            except Exception:
+                pass
+        # #5567: install the context-local Hermes-home override so the agent
+        # config reader (get_hermes_home -> get_config_path/load_config) resolves
+        # THIS profile's home from task-local state, immune to a concurrent
+        # cross-profile os.environ["HERMES_HOME"] clobber during the worker body.
+        # No-op on agents < v0.18.0 (resolver returns None) → os.environ mirror
+        # below remains the behavior, exactly as today.
+        _home_override_mod = _resolve_hermes_home_override()
+        if _home_override_mod is not None:
+            try:
+                _home_override_token = _home_override_mod.set_hermes_home_override(
+                    str(profile_home_path)
+                )
+                _home_override_installed = True
+            except Exception:
+                _home_override_token = None
+                _home_override_installed = False
+
+        if scope_skill_modules:
+            if _home_override_mod is not None and _home_override_installed:
+                try:
+                    has_profile_skill_home = _skill_modules_support_profile_home(
+                        profile_home_path
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to evaluate profile-home skill module capability for %s in %s",
+                        profile,
+                        purpose,
+                        exc_info=True,
+                    )
+                    has_profile_skill_home = False
+
+            # #5567-fallback: if override is unavailable, or module-side
+            # profile resolution is missing/failed, serialize the full worker
+            # lifespan under the shared legacy patch lock.
+            should_restore_skill_modules = not (
+                _home_override_installed and has_profile_skill_home
+            )
+            if should_restore_skill_modules:
+                _SKILL_HOME_MODULE_PATCH_LOCK.acquire()
+                _acquired_skill_home_patch_lock = True
+
         with _ENV_LOCK:
-            old_runtime_env = {key: os.environ.get(key) for key in safe_runtime_env}
+            if scope_skill_modules and should_restore_skill_modules:
+                # Snapshot and patch before mutating process env so setup
+                # failures can unwind without leaking either state.
+                skill_home_snapshot = snapshot_skill_home_modules()
+                patch_skill_home_modules(profile_home_path)
+
+            old_runtime_env = _apply_profile_env_to_process(
+                os.environ,
+                safe_runtime_env,
+                secret_env_names=secret_env_names,
+            )
             had_hermes_home = "HERMES_HOME" in os.environ
             old_hermes_home = os.environ.get("HERMES_HOME")
-            skill_home_snapshot = snapshot_skill_home_modules()
             os.environ.update(safe_runtime_env)
             os.environ["HERMES_HOME"] = str(profile_home_path)
+        yield
+    finally:
+        try:
+            with _ENV_LOCK:
+                for key, old_value in old_runtime_env.items():
+                    if old_value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = old_value
+                if had_hermes_home:
+                    os.environ["HERMES_HOME"] = old_hermes_home or ""
+                else:
+                    os.environ.pop("HERMES_HOME", None)
+                if should_restore_skill_modules and skill_home_snapshot is not None:
+                    restore_skill_home_modules(skill_home_snapshot)
+        finally:
+            if _acquired_skill_home_patch_lock:
+                _SKILL_HOME_MODULE_PATCH_LOCK.release()
+                _acquired_skill_home_patch_lock = False
+            # Reset context-local state after the fallback globals are restored.
+            if _home_override_mod is not None and _home_override_installed:
+                try:
+                    _home_override_mod.reset_hermes_home_override(_home_override_token)
+                except Exception:
+                    pass
+            if _has_scope and _secret_scope_mod is not None:
+                try:
+                    _secret_scope_mod.reset_secret_scope(_scope_token)
+                except Exception:
+                    pass
+            _thread_ctx.block_process_env_fallback = previous_block_process_env
+            if previous_thread_env:
+                _set_thread_env(**previous_thread_env)
+            else:
+                _clear_thread_env()
+
+
+@contextmanager
+def profile_env_for_active_request_readonly(
+    purpose: str = "provider/model read",
+    logger_override: Optional[logging.Logger] = None,
+):
+    """Apply the active per-request profile's env to thread-local state only (#3957).
+
+    WebUI profile switching is per-client/cookie scoped (issue #798): a browser
+    on a named profile sets a ``hermes_profile`` cookie, which ``server.py``
+    turns into a thread-local via ``set_request_profile()``.  This wrapper keeps
+    provider-credential reads isolated to the request profile and does not touch
+    process-wide environment for read-only endpoints.
+
+    A thread-local read-only scope is used for ``/api/providers`` and
+    ``/api/models`` flows that now resolve credentials through thread-local
+    environment first. It also sets a context-local Hermes-home override so
+    agent-side auth-store reads stay on the active profile without mutating
+    process-global ``os.environ``.
+
+    No-ops for the default/root profile, which is the common single-profile
+    deployment case.
+    """
+    profile = (get_active_profile_name() or "").strip()
+    if not profile or _is_root_profile(profile):
+        yield
+        return
+    try:
+        from api.config import _clear_thread_env, _set_thread_env, _thread_ctx
+        profile_home_path = Path(get_hermes_home_for_profile(profile))
+        runtime_env = get_profile_runtime_env(profile_home_path)
+        safe_runtime_env = filter_runtime_env_for_gateway_parity(runtime_env)
+    except Exception:
+        log = logger_override or logger
+        log.debug(
+            "Failed to resolve profile env for active request profile %s in %s; "
+            "falling back to current env",
+            profile,
+            purpose,
+            exc_info=True,
+        )
+        yield
+        return
+    try:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+    except Exception:
+        reset_hermes_home_override = None
+        set_hermes_home_override = None
+
+    thread_env = dict(safe_runtime_env)
+    thread_env["HERMES_HOME"] = str(profile_home_path)
+    previous_thread_env = getattr(_thread_ctx, "env", {}).copy()
+    previous_block_process_env = bool(
+        getattr(_thread_ctx, "block_process_env_fallback", False)
+    )
+    home_override_token = None
+    home_override_installed = False
+    _scope_token = None
+    _has_scope = False
+    try:
+        _set_thread_env(**thread_env)
+        _thread_ctx.block_process_env_fallback = True
+        _secret_scope_mod = _resolve_secret_scope_module()
+        _scope_token = None
+        _has_scope = False
+        if _secret_scope_mod is not None:
             try:
-                patch_skill_home_modules(profile_home_path)
+                _scope_token = _secret_scope_mod.set_secret_scope(thread_env)
+                _has_scope = True
             except Exception:
-                log.debug(
-                    "Failed to patch skill modules for %s profile %s",
-                    purpose,
+                pass
+        if set_hermes_home_override is not None:
+            try:
+                home_override_token = set_hermes_home_override(profile_home_path)
+                home_override_installed = True
+            except Exception:
+                logger.debug(
+                    "Failed to install Hermes-home override for active request profile %s in %s",
                     profile,
+                    purpose,
                     exc_info=True,
                 )
         yield
     finally:
+        if _has_scope and _secret_scope_mod is not None:
+            try:
+                _secret_scope_mod.reset_secret_scope(_scope_token)
+            except Exception:
+                pass
+        if reset_hermes_home_override is not None and home_override_installed:
+            try:
+                reset_hermes_home_override(home_override_token)
+            except Exception:
+                (logger_override or logger).debug(
+                    "Failed to reset Hermes-home override for active request profile %s in %s",
+                    profile,
+                    purpose,
+                    exc_info=True,
+                )
+        _thread_ctx.block_process_env_fallback = previous_block_process_env
         if previous_thread_env:
             _set_thread_env(**previous_thread_env)
         else:
             _clear_thread_env()
-        with _ENV_LOCK:
-            for key, old_value in old_runtime_env.items():
-                if old_value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = old_value
-            if had_hermes_home:
-                os.environ["HERMES_HOME"] = old_hermes_home or ""
-            else:
-                os.environ.pop("HERMES_HOME", None)
-            if skill_home_snapshot is not None:
-                restore_skill_home_modules(skill_home_snapshot)
 
 
 @contextmanager
 def profile_env_for_active_request(
-    purpose: str = "provider/model read",
+    purpose: str = "active request",
     logger_override: Optional[logging.Logger] = None,
 ):
-    """Apply the active per-request profile's env around a read-only API call (#3957).
+    """Apply the active per-request profile through the legacy mirrored path.
 
-    WebUI profile switching is per-client/cookie scoped (issue #798): a browser
-    on a named profile sets a ``hermes_profile`` cookie, which ``server.py``
-    turns into a thread-local via ``set_request_profile()``.  But the per-client
-    switch deliberately does NOT reload the profile's ``.env`` into
-    ``os.environ`` (that would mutate process-global state shared with other
-    clients).  So read-only endpoints that resolve provider credentials through
-    ``os.environ`` / ``HERMES_HOME`` — ``/api/providers`` (``get_auth_status``
-    probes) and ``/api/models`` (``provider_model_ids`` / custom-key lookup) —
-    resolve against the *default* profile's credentials instead of the active
-    one.  Symptoms: Settings → Providers times out and the model picker shows
-    only the default profile's models.
-
-    This mirrors what streaming already does for the duration of an agent run
-    (``profile_env_for_background_worker``): it temporarily applies the active
-    profile's ``.env`` + terminal config for the duration of the wrapped read,
-    then restores the previous env under ``_ENV_LOCK``.
-
-    No-ops (zero overhead, byte-identical behavior) for the default/root profile
-    — the overwhelmingly common single-profile deployment is unaffected.
+    Some request-scoped readers still delegate into Hermes helpers that resolve
+    credentials directly from process env or ``get_hermes_home()``. Those paths
+    stay on the mirrored scope until they are fully audited.
     """
     profile = (get_active_profile_name() or "").strip()
     if not profile or _is_root_profile(profile):
@@ -1277,29 +1753,91 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
     }
 
 
-_SKILLS_STATS_CACHE: dict[Path, tuple[int, int, float]] = {}
-_SKILLS_STATS_CACHE_TTL = 8.0  # seconds
+_SKILLS_STATS_CACHE: dict[Path, tuple[int, int, int, float]] = {}
+_SKILLS_STATS_CACHE_TTL = 300.0  # seconds — long because .clear() handles programmatic changes
+
+# Per-profile compute locks (#5364). Without these, concurrent cold-startup
+# requests (ThreadingHTTPServer runs one OS thread per request) all miss the
+# unlocked _SKILLS_STATS_CACHE at once and each walks + parses the whole skill
+# tree simultaneously — a thundering herd that stalled workers 57–70s under
+# Docker overlay2. A per-profile lock lets independent profiles compute in
+# parallel while collapsing concurrent misses on the SAME profile to a single
+# shared compute (double-checked locking below). The lock registry is guarded by
+# its own meta-lock and is bounded by the (small) number of profiles.
+_SKILLS_STATS_LOCKS: dict[Path, threading.Lock] = {}
+_SKILLS_STATS_LOCKS_GUARD = threading.Lock()
 
 
-def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
-    """Calculate (enabled_count, compatible_count) for a profile directory."""
-    import time
-    profile_dir = Path(profile_dir).resolve()
-    now = time.time()
-    # Read via .get() (not membership-check + index) so a concurrent
-    # _SKILLS_STATS_CACHE.clear() on another thread can't raise KeyError
-    # between the `in` test and the lookup.
-    cached = _SKILLS_STATS_CACHE.get(profile_dir)
-    if cached is not None:
-        enabled, compat, expiry = cached
-        if now < expiry:
-            return enabled, compat
+def _skills_stats_lock_for(profile_dir: Path) -> threading.Lock:
+    """Return (creating if needed) the per-profile compute lock for profile_dir.
 
+    profile_dir must already be resolved so distinct spellings of the same
+    directory share one lock.
+    """
+    with _SKILLS_STATS_LOCKS_GUARD:
+        lock = _SKILLS_STATS_LOCKS.get(profile_dir)
+        if lock is None:
+            lock = threading.Lock()
+            _SKILLS_STATS_LOCKS[profile_dir] = lock
+        return lock
+
+
+def _skill_tree_max_mtime_ns(skills_dir: Path, config_path: Path) -> int:
+    """Return the max st_mtime_ns across config.yaml, skill dirs, and SKILL.md files."""
+    max_ns = 0
+    try:
+        if config_path.exists():
+            max_ns = max(max_ns, config_path.stat().st_mtime_ns)
+    except OSError:
+        pass
+    if not skills_dir.is_dir():
+        return max_ns
+    try:
+        from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
+    except Exception:
+        EXCLUDED_SKILL_DIRS = frozenset()
+        SKILL_SUPPORT_DIRS = frozenset()
+    try:
+        # Directory mtimes catch nested out-of-band deletes that leave file mtimes unchanged.
+        # followlinks=True mirrors agent.skill_utils.iter_skill_index_files (the compute
+        # path), so a symlinked skill directory is descended into and edits to its target
+        # SKILL.md change the probe value — otherwise such edits would stay stale up to the TTL.
+        for root, dirnames, filenames in os.walk(skills_dir, followlinks=True):
+            root_path = Path(root)
+            # Prune the SAME trees iter_skill_index_files prunes (.git/.venv/
+            # node_modules/site-packages + skill support dirs), so a skill that
+            # vendors a dependency tree doesn't make this every-call probe walk
+            # thousands of irrelevant files and defeat the cache's perf goal.
+            has_skill_md = "SKILL.md" in filenames
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in EXCLUDED_SKILL_DIRS
+                and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+            ]
+            try:
+                max_ns = max(max_ns, root_path.stat().st_mtime_ns)
+            except OSError:
+                pass
+            for dirname in dirnames:
+                try:
+                    max_ns = max(max_ns, (root_path / dirname).stat().st_mtime_ns)
+                except OSError:
+                    pass
+            if "SKILL.md" in filenames:
+                try:
+                    max_ns = max(max_ns, (root_path / "SKILL.md").stat().st_mtime_ns)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return max_ns
+
+
+def _compute_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
+    """Compute (enabled_count, compatible_count) by reading and parsing all SKILL.md files."""
     skills_dir = profile_dir / "skills"
     if not skills_dir.is_dir():
-        res = (0, 0)
-        _SKILLS_STATS_CACHE[profile_dir] = (res[0], res[1], now + _SKILLS_STATS_CACHE_TTL)
-        return res
+        return (0, 0)
 
     disabled = set()
     config_path = profile_dir / "config.yaml"
@@ -1316,7 +1854,7 @@ def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
                         disabled_val = platform_disabled
                     else:
                         disabled_val = skills_cfg.get("disabled")
-                    
+
                     if disabled_val is not None:
                         if isinstance(disabled_val, str):
                             disabled_val = [disabled_val]
@@ -1325,11 +1863,11 @@ def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
             pass
 
     from agent.skill_utils import iter_skill_index_files, parse_frontmatter, skill_matches_platform
-    
+
     seen_names = set()
     enabled_count = 0
     compatible_count = 0
-    
+
     for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
         try:
             content = skill_md.read_text(encoding="utf-8")[:4000]
@@ -1340,22 +1878,77 @@ def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
             if name in seen_names:
                 continue
             seen_names.add(name)
-            
+
             compatible_count += 1
             if name not in disabled:
                 enabled_count += 1
         except Exception:
             pass
-            
-    res = (enabled_count, compatible_count)
-    _SKILLS_STATS_CACHE[profile_dir] = (res[0], res[1], now + _SKILLS_STATS_CACHE_TTL)
-    return res
+
+    return (enabled_count, compatible_count)
+
+
+def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
+    """Calculate (enabled_count, compatible_count) with two-tier mtime cache.
+
+    A cheap stat-only mtime probe runs on EVERY call so out-of-band (CLI/git)
+    skill changes are reflected promptly — the expensive part (reading + parsing
+    every SKILL.md) is what the cache avoids, not the change detection. The TTL
+    is only a safety-net upper bound that forces an occasional full recompute
+    even when the mtime probe sees no change.
+    """
+    import time
+    profile_dir = Path(profile_dir).resolve()
+    now = time.time()
+    skills_dir = profile_dir / "skills"
+    config_path = profile_dir / "config.yaml"
+
+    # Always run the cheap stat-only probe first — this is what catches an
+    # out-of-band create/edit/delete within the same request (not after the TTL).
+    current_mtime_ns = _skill_tree_max_mtime_ns(skills_dir, config_path)
+
+    # Read via .get() (not membership-check + index) so a concurrent
+    # _SKILLS_STATS_CACHE.clear() on another thread can't raise KeyError
+    # between the `in` test and the lookup.
+    cached = _SKILLS_STATS_CACHE.get(profile_dir)
+    if cached is not None:
+        enabled, compat, cached_mtime_ns, expiry = cached
+        # Fast path: files unchanged (by the cheap probe above) AND still within
+        # the TTL → serve cached without re-reading any SKILL.md. The mtime probe
+        # already ran, so an out-of-band change is caught immediately regardless
+        # of the TTL. On TTL expiry we deliberately fall through to a full
+        # recompute (the TTL is a safety net for mtime-preserving changes that
+        # the probe can't see — e.g. a git checkout that restores the old mtime).
+        if current_mtime_ns == cached_mtime_ns and now < expiry:
+            return enabled, compat
+
+    # Cache miss, mtime changed, or TTL expired — serialize per-profile so a
+    # burst of concurrent misses (cold startup) collapses to ONE compute instead
+    # of a thundering herd of simultaneous os.walk + SKILL.md parses (#5364).
+    lock = _skills_stats_lock_for(profile_dir)
+    with lock:
+        # Double-checked locking: another thread may have populated a fresh entry
+        # while we waited for the lock. Reuse it when the mtime we already probed
+        # still matches and the entry is within its TTL — no second compute.
+        cached = _SKILLS_STATS_CACHE.get(profile_dir)
+        if cached is not None:
+            enabled, compat, cached_mtime_ns, expiry = cached
+            if current_mtime_ns == cached_mtime_ns and time.time() < expiry:
+                return enabled, compat
+
+        # Snapshot mtime BEFORE compute so any concurrent SKILL.md write during
+        # the compute window causes a mismatch on the next probe instead of
+        # silently serving stale data (TOCTOU).
+        new_mtime_ns = _skill_tree_max_mtime_ns(skills_dir, config_path)
+        res = _compute_profile_skills_stats(profile_dir)
+        _SKILLS_STATS_CACHE[profile_dir] = (
+            res[0], res[1], new_mtime_ns, time.time() + _SKILLS_STATS_CACHE_TTL
+        )
+        return res
 
 
 _LIST_PROFILES_CACHE: tuple[list, float] | None = None
-_LIST_PROFILES_CACHE_TTL = 4.0  # seconds — short enough that gateway dots / new
-                                # profiles stay near-live, long enough that rapid
-                                # re-opens of the dropdown are free.
+_LIST_PROFILES_CACHE_TTL = 4.0  # seconds. The perf(session-load-latency) pass bumped this to 60s, but that was reverted: profile-row mutations (defaults / providers / skills / gateway config) do NOT invalidate this cache, so a 60s TTL served stale profile rows for too long after such a change. 4s keeps the os.walk frequent enough that mutation→poll staleness is negligible while still making rapid dropdown re-opens free. The create/delete invalidation hooks below clear the cache immediately on those specific mutations.
 _LIST_PROFILES_CACHE_LOCK = threading.Lock()
 
 
@@ -1508,14 +2101,21 @@ def list_profiles_api() -> list:
             'total_skills': total_count,
         }]
 
+    # Single-flight the build (#5364): hold the cache lock across the row build
+    # so a cold-startup burst of concurrent requests collapses to ONE build while
+    # the others wait and then serve the freshly-cached rows — instead of every
+    # thread rebuilding (each walking all profiles' skill trees) at once. The
+    # per-profile skills locks taken inside _build_profile_rows_fast are always
+    # acquired AFTER this lock (never the reverse), so there is no deadlock.
     with _LIST_PROFILES_CACHE_LOCK:
         cached = _LIST_PROFILES_CACHE
-    if cached is not None and now - cached[1] < _LIST_PROFILES_CACHE_TTL:
-        active = get_active_profile_name()
-        # Return a fresh copy with is_active recomputed (cheap, per-request).
-        return [{**p, 'is_active': p['name'] == active} for p in cached[0]]
+        if cached is not None and now - cached[1] < _LIST_PROFILES_CACHE_TTL:
+            rows = cached[0]
+        else:
+            rows = _build_profile_rows_fast()
+            if rows is not None:
+                _LIST_PROFILES_CACHE = (rows, now)
 
-    rows = _build_profile_rows_fast()
     if rows is None:
         # Fallback: cheap helpers unavailable — use the original (slow) path,
         # or the default-only dict if hermes_cli isn't importable at all.
@@ -1548,9 +2148,6 @@ def list_profiles_api() -> list:
                 'total_skills': total_count,
             })
         return result
-
-    with _LIST_PROFILES_CACHE_LOCK:
-        _LIST_PROFILES_CACHE = (rows, now)
 
     active = get_active_profile_name()
     return [{**p, 'is_active': p['name'] == active} for p in rows]
@@ -1778,7 +2375,7 @@ def _write_endpoint_to_config(profile_dir: Path, base_url: str = None, api_key: 
     if base_url:
         model_section['base_url'] = base_url
     cfg['model'] = model_section
-    config_path.write_text(_yaml.dump(cfg, default_flow_style=False, allow_unicode=True), encoding='utf-8')
+    _atomic_write_text(config_path, _yaml.dump(cfg, default_flow_style=False, allow_unicode=True), encoding='utf-8')
 
 
 def _clean_profile_config_value(value: Optional[str], field: str) -> Optional[str]:
@@ -1834,7 +2431,8 @@ def _profile_model_selection_exists(
             continue
         if model_provider and provider_id == model_provider:
             provider_seen = True
-        for model in group.get("models", []) or []:
+        all_group_models = (group.get("models") or []) + (group.get("extra_models") or [])
+        for model in all_group_models:
             if not isinstance(model, dict):
                 continue
             model_id = str(model.get("id") or "").strip()
@@ -1916,7 +2514,7 @@ def _write_model_defaults_to_config(
     if model_provider:
         model_section['provider'] = model_provider
     cfg['model'] = model_section
-    config_path.write_text(_yaml.dump(cfg, default_flow_style=False, allow_unicode=True), encoding='utf-8')
+    _atomic_write_text(config_path, _yaml.dump(cfg, default_flow_style=False, allow_unicode=True), encoding='utf-8')
 
 
 def create_profile_api(name: str, clone_from: str = None,
