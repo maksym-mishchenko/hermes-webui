@@ -194,6 +194,10 @@ def test_docker_init_stages_agent_source_for_writable_install():
         if "uv pip install" in line and "[all]" in line
     ]
     assert install_lines, "expected an `uv pip install ...[all]` line in docker_init.bash"
+    assert all(" -e " in line for line in install_lines), (
+        "hermes-agent rejects wheel/sdist builds; Docker startup must install "
+        "the staged source tree in editable mode"
+    )
     for line in install_lines:
         assert '"$_agent_src[all]"' not in line, (
             "docker_init.bash invokes `uv pip install $_agent_src[all]` "
