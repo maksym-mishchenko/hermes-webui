@@ -149,7 +149,10 @@ def _memory_render_blocks():
     panels = (REPO_ROOT / "static" / "panels.js").read_text(encoding="utf-8")
     helper_start = panels.index("function _memorySectionContent(key)")
     helper_end = panels.index("function _setMemoryHeaderButtons", helper_start)
-    render_start = panels.index("function _renderMemoryDetail(section)")
+    # Include the renderer-policy helper with the detail function. The production
+    # function calls it, so omitting it makes the Node harness fail before it can
+    # assert the rendered paths.
+    render_start = panels.index("function _memorySectionRendersMarkdown(section)")
     render_end = panels.index("function _renderMemoryEdit", render_start)
     return panels[helper_start:helper_end], panels[render_start:render_end]
 
