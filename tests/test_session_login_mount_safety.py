@@ -11,8 +11,6 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urljoin, urlparse
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
